@@ -5,9 +5,9 @@ import { INITIAL_MAS_BENCHMARK, DEFAULT_MAS_DAILY_RATES } from '../data/masSoraR
 const BACKEND_CONFIG_KEY = 'mas_sora_backend_config';
 
 export const DEFAULT_BACKEND_CONFIG: BackendIntegrationConfig = {
-  backendEndpointUrl: '/api/mas/sora-rates',
+  backendEndpointUrl: '/api/sora',
   apiKey: '',
-  useLiveMasProxy: false,
+  useLiveMasProxy: true, // Attempt serverless proxy by default
   enableDebugLogs: false,
 };
 
@@ -34,22 +34,56 @@ export function saveBackendConfig(config: BackendIntegrationConfig): void {
 export interface FetchRatesResult {
   summary: SoraBenchmarkSummary;
   dailyRates: SoraDailyRate[];
-  source: 'MAS_OFFICIAL_DATA' | 'CUSTOM_BACKEND' | 'FALLBACK';
+  source: 'MAS_LIVE_API' | 'MAS_OFFICIAL_DATA' | 'CUSTOM_BACKEND' | 'FALLBACK';
   message: string;
   timestamp: string;
   statusCode?: number;
+  masKeyConfigured?: boolean;
+}
+
+/**
+ * Health check helper for /api/health
+ */
+export async function checkServerHealth(): Promise<{
+  ok: boolean;
+  masKeyConfigured: boolean;
+  uptimeSeconds: number;
+  timestamp: string;
+  message?: string;
+}> {
+  try {
+    const res = await fetch('/api/health');
+    if (!res.ok) {
+      return { ok: false, masKeyConfigured: false, uptimeSeconds: 0, timestamp: new Date().toISOString(), message: `HTTP ${res.status}` };
+    }
+    const data = await res.json();
+    return {
+      ok: data.status === 'ok',
+      masKeyConfigured: Boolean(data.environment?.masKeyConfigured),
+      uptimeSeconds: data.uptimeSeconds || 0,
+      timestamp: data.timestamp || new Date().toISOString(),
+    };
+  } catch (err: any) {
+    return {
+      ok: false,
+      masKeyConfigured: false,
+      uptimeSeconds: 0,
+      timestamp: new Date().toISOString(),
+      message: err.message,
+    };
+  }
 }
 
 /**
  * Service to fetch SORA benchmark & overnight rates
- * Checks custom backend URL if configured and enabled, otherwise uses built-in MAS dataset
+ * Queries the serverless endpoint (/api/sora) which connects to MAS APIM Gateway with KeyId header
  */
 export async function fetchMasSoraRates(
   config: BackendIntegrationConfig = getSavedBackendConfig()
 ): Promise<FetchRatesResult> {
   const timestamp = new Date().toISOString();
 
-  // If custom backend proxy is enabled and url provided
+  // Try serverless endpoint (/api/sora or custom configured URL)
   if (config.useLiveMasProxy && config.backendEndpointUrl) {
     try {
       const headers: Record<string, string> = {
@@ -64,28 +98,50 @@ export async function fetchMasSoraRates(
         headers,
       });
 
-      if (!response.ok) {
-        throw new Error(`Backend returned status ${response.status}: ${response.statusText}`);
+      const data = await response.json();
+
+      // If MAS_KEY_ID was missing, serverless returns 400 with CONFIG_REQUIRED
+      if (data.source === 'CONFIG_REQUIRED') {
+        return {
+          summary: INITIAL_MAS_BENCHMARK,
+          dailyRates: DEFAULT_MAS_DAILY_RATES,
+          source: 'MAS_OFFICIAL_DATA',
+          message: 'Official MAS benchmark active (Set MAS_KEY_ID in .env for live gateway sync)',
+          timestamp,
+          statusCode: 200,
+          masKeyConfigured: false,
+        };
       }
 
-      const data = await response.json();
-      
-      // Expected structure from user's future backend:
-      // { summary: SoraBenchmarkSummary, dailyRates?: SoraDailyRate[] }
-      if (data && data.summary && typeof data.summary.compounded3M === 'number') {
+      // If live MAS data returned
+      if (data.success && data.summary && typeof data.summary.compounded3M === 'number') {
         return {
           summary: {
             ...data.summary,
-            source: 'CUSTOM_BACKEND',
+            source: 'MAS_OFFICIAL_DATA',
           },
-          dailyRates: Array.isArray(data.dailyRates) ? data.dailyRates : DEFAULT_MAS_DAILY_RATES,
-          source: 'CUSTOM_BACKEND',
-          message: `Connected successfully to ${config.backendEndpointUrl}`,
+          dailyRates: Array.isArray(data.dailyRates) && data.dailyRates.length > 0
+            ? data.dailyRates
+            : DEFAULT_MAS_DAILY_RATES,
+          source: 'MAS_LIVE_API',
+          message: 'Live MAS APIM Gateway data loaded (Authenticated via KeyId)',
           timestamp,
           statusCode: response.status,
+          masKeyConfigured: true,
         };
-      } else {
-        throw new Error('Backend response did not match expected SORA benchmark schema');
+      }
+
+      // If MAS Gateway returned an error status (e.g. 401 invalid key)
+      if (data.error) {
+        return {
+          summary: INITIAL_MAS_BENCHMARK,
+          dailyRates: DEFAULT_MAS_DAILY_RATES,
+          source: 'FALLBACK',
+          message: `MAS Gateway: ${data.error}. Using bundled MAS benchmark data.`,
+          timestamp,
+          statusCode: data.statusCode || response.status,
+          masKeyConfigured: true,
+        };
       }
     } catch (err: any) {
       if (config.enableDebugLogs) {
@@ -95,18 +151,19 @@ export async function fetchMasSoraRates(
         summary: INITIAL_MAS_BENCHMARK,
         dailyRates: DEFAULT_MAS_DAILY_RATES,
         source: 'FALLBACK',
-        message: `Backend connection error (${err.message || 'Offline'}). Using bundled MAS official data.`,
+        message: 'Using bundled MAS official data (Serverless endpoint offline).',
         timestamp,
       };
     }
   }
 
-  // Standard official MAS offline/bundled rates (instant, accurate, no CORS or maintenance errors)
+  // Standard official MAS bundled rates
   return {
     summary: INITIAL_MAS_BENCHMARK,
     dailyRates: DEFAULT_MAS_DAILY_RATES,
     source: 'MAS_OFFICIAL_DATA',
     message: 'Official MAS benchmark rates loaded (Publication: 9:00 AM SGT)',
     timestamp,
+    masKeyConfigured: false,
   };
 }
